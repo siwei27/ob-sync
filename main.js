@@ -420,6 +420,10 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
         const { buf, mtime } = await read();
         await this.uploadBinary(path, Promise.resolve(buf), mtime, kind);
       } catch (e) {
+        if (e instanceof Error && (e.message.includes("ENOENT") || e.code === "ENOENT")) {
+          if (this.state.syncedFiles[path]) await this.queueDelete(path);
+          return;
+        }
         console.error(`[CF Sync] \u4E0A\u4F20\u5931\u8D25 ${path}`, e);
       }
     });
@@ -444,8 +448,8 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
       await this.savePluginData();
       return;
     }
-    const baseHash = this.state.syncedFiles[path]?.hash;
     const upsert = async () => {
+      const baseHash = this.state.syncedFiles[path]?.hash;
       const res = await fetch(`${this.settings.endpoint}/api/files/upsert`, {
         method: "POST",
         headers: {
@@ -495,7 +499,7 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
       new import_obsidian2.Notice(`\u540C\u6B65\u51B2\u7A81\uFF1A\u5DF2\u53E6\u5B58\u4E3A ${result.conflictPath}`);
       await this.pullDelta();
     } else if (result.status === "ok") {
-      this.state.syncedFiles[path] = { hash, mtime };
+      this.recordSynced(path, hash, mtime, result.syncSeq ?? 0);
       await this.savePluginData();
     }
     this.updateStatusBar(`\u5DF2\u540C\u6B65 (seq:${this.state.lastSyncSeq})`);
@@ -577,6 +581,11 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
             settledSeqs.add(item.syncSeq);
             continue;
           }
+          const knownSeq = this.state.syncedFiles[item.path]?.seq;
+          if (knownSeq !== void 0 && item.syncSeq <= knownSeq) {
+            settledSeqs.add(item.syncSeq);
+            continue;
+          }
           if (item.deleted) {
             try {
               const existing = this.app.vault.getAbstractFileByPath(item.path);
@@ -616,6 +625,18 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
               this.scheduleDeferredFlush();
               new import_obsidian2.Notice(`\u8FDC\u7AEF\u6709\u66F4\u65B0\uFF1A${item.path}\uFF0C\u5C06\u5728\u505C\u6B62\u8F93\u5165\u540E\u81EA\u52A8\u5408\u5E76`);
               continue;
+            }
+            if (activeFile?.path === item.path) {
+              const local = this.app.vault.getAbstractFileByPath(item.path);
+              if (local instanceof import_obsidian2.TFile) {
+                const localHash = await this.sha256Hex(await this.app.vault.readBinary(local));
+                const lastSyncedHash = this.state.syncedFiles[item.path]?.hash;
+                if (lastSyncedHash && localHash !== lastSyncedHash && localHash !== item.hash) {
+                  this.deferredItems.set(item.path, { item, text });
+                  this.scheduleDeferredFlush();
+                  continue;
+                }
+              }
             }
             try {
               await this.writeLocalText(item, text);
@@ -691,16 +712,29 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
         const localHash = await this.sha256Hex(localBuf);
         const lastSyncedHash = this.state.syncedFiles[path]?.hash;
         if (lastSyncedHash && localHash !== lastSyncedHash && localHash !== item.hash) {
-          await this.enqueueUpload(path, "note", async () => ({
-            buf: localBuf,
-            mtime: existing.stat.mtime
-          }));
+          await this.enqueueUpload(path, "note", async () => {
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (!(f instanceof import_obsidian2.TFile)) throw new Error(`file gone: ${path}`);
+            return { buf: await this.app.vault.readBinary(f), mtime: f.stat.mtime };
+          });
+          continue;
+        }
+        if (lastSyncedHash && lastSyncedHash !== item.hash) {
+          const stat = await this.app.vault.adapter.stat(path);
+          this.recordSynced(path, localHash, stat?.mtime ?? existing.stat.mtime, item.syncSeq);
+          await this.savePluginData();
+          continue;
         }
       }
       await this.writeLocalText(item, text);
     }
     await this.savePluginData();
     await this.pullDelta();
+  }
+  /** 记录一次已确认的同步状态：hash/mtime 取实测值，seq 只进不退。 */
+  recordSynced(path, hash, mtime, seq) {
+    const prev = this.state.syncedFiles[path];
+    this.state.syncedFiles[path] = { hash, mtime, seq: Math.max(prev?.seq ?? 0, seq) };
   }
   /**
    * 关键修复：
@@ -717,17 +751,17 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
       if (existing instanceof import_obsidian2.TFile) {
         await this.app.vault.modify(existing, text);
         const stat3 = await this.app.vault.adapter.stat(normPath);
-        this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat3?.mtime ?? existing.stat.mtime };
+        this.recordSynced(normPath, item.hash, stat3?.mtime ?? existing.stat.mtime, item.syncSeq);
         return;
       }
       const created = await this.app.vault.create(normPath, text);
       const stat2 = await this.app.vault.adapter.stat(normPath);
-      this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat2?.mtime ?? created.stat.mtime };
+      this.recordSynced(normPath, item.hash, stat2?.mtime ?? created.stat.mtime, item.syncSeq);
       return;
     }
     await this.app.vault.adapter.write(normPath, text);
     const stat = await this.app.vault.adapter.stat(normPath);
-    this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat?.mtime ?? Date.now() };
+    this.recordSynced(normPath, item.hash, stat?.mtime ?? Date.now(), item.syncSeq);
   }
   async writeLocalBinary(item, buf) {
     const normPath = (0, import_obsidian2.normalizePath)(item.path);
@@ -739,17 +773,17 @@ var CfSyncPlugin = class extends import_obsidian2.Plugin {
       if (existing instanceof import_obsidian2.TFile) {
         await this.app.vault.modifyBinary(existing, buf);
         const stat3 = await this.app.vault.adapter.stat(normPath);
-        this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat3?.mtime ?? existing.stat.mtime };
+        this.recordSynced(normPath, item.hash, stat3?.mtime ?? existing.stat.mtime, item.syncSeq);
         return;
       }
       const created = await this.app.vault.createBinary(normPath, buf);
       const stat2 = await this.app.vault.adapter.stat(normPath);
-      this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat2?.mtime ?? created.stat.mtime };
+      this.recordSynced(normPath, item.hash, stat2?.mtime ?? created.stat.mtime, item.syncSeq);
       return;
     }
     await this.app.vault.adapter.writeBinary(normPath, buf);
     const stat = await this.app.vault.adapter.stat(normPath);
-    this.state.syncedFiles[normPath] = { hash: item.hash, mtime: stat?.mtime ?? Date.now() };
+    this.recordSynced(normPath, item.hash, stat?.mtime ?? Date.now(), item.syncSeq);
   }
 };
 async function runPool(items, limit, worker) {
